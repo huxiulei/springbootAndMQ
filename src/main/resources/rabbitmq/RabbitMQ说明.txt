@@ -1,0 +1,127 @@
+一: 消息丢失
+    RabbitMQ中，消息丢失可以简单的分为两种：客户端丢失和服务端丢失
+    客户端丢失:(消息确认Message acknowledgment即ACK模式)
+            RabbitMQ引入了消息确认机制，当消息处理完成后，给Server端发送一个确认消息，来告诉服务端可以删除该消息了，如果连接断开的时候，Server端没有收到消费者发出的确认信息，则会把消息转发给其他保持在线的消费者。
+            可以采用同步模式或者异步模式 具体参见 RabbitMQProducerSync/RabbitMQCustomerSync RabbitMQProducerAsync
+            注意:如果消费者忘了确认（或者是因为代码的问题导致没有执行到确认的地方--->此处可以使用try catch finally），将会导致内存泄漏
+
+    自动应答-当RabbitMQ把消息发送到接收端，接收端把消息出队列的时候就自动帮你发应答消息给服务。(所以并没有关注消费端有没有正确消费掉数据..所以我们一般采用手动应答..而且如果选择了自动应答，那么消息重发这个功能就没有了。)
+    手动应答-需要我们开发人员手动去调用ack方法去告诉服务已经收到。
+
+
+
+    服务端丢失:(持久化)
+            防止服务端丢失可以在生产端创建exchange/queue时设置durable为true(持久话) 同时basicPublish时props也要设置MessageProperties.PERSISTENT_TEXT_PLAIN
+            但是如果正在持久化的时候宕机了(极端情况) 还是有可能丢失小部分数据的   那怎么处理呢?? RabbitMQ官方给的方案是采用事务机制
+
+
+
+
+二: 消息重复
+    如果客户端正在给服务端ACK的时候 出现了异常(客户端), 那么服务端没有收到这个消息的ACK,就会产生消息被重复消费的问题
+    这个重复的问题就需要业务系统自己去解决了
+        1. 消费端处理消息的业务逻辑保持幂等性
+        2. 保证每条消息都有唯一编号且保证消息处理成功与去重表的日志同时出现
+
+
+
+
+
+三: 消息失败重试
+    basicRecover：是路由不成功的消息可以使用recovery重新发送到队列中。
+    basicReject：是接收端告诉服务器这个消息我拒绝接收,不处理,可以设置是否放回到队列中还是丢掉，而且只能一次拒绝一个消息,官网中有明确说明不能批量拒绝消息，为解决批量拒绝消息才有了basicNack。
+    basicNack：可以一次拒绝N条消息，客户端可以设置basicNack方法的multiple参数为true，服务器会拒绝指定了delivery_tag的所有未确认的消息(tag是一个64位的long值，最大值是9223372036854775807)。
+    代码可参见 WorkX/WorkTask    (http://blog.csdn.net/everlasting_188/article/details/53306575)
+
+
+
+
+四: 消息的顺序
+    为了保障数据的实时性，是多线程处理，每一条数据根据主键ID取模（通过某种算法，将需要保持先后顺序的消息放到同一个消息队列中），保障每条被同一个线程处理。线程要设置一个属性表示自己对应的处理那个映射的数据，涉及到分布式环境，
+    需要有一个统一的配置，可以放在zk上进行配置，也可以根据各个节点的名称，按照一定个规则生成，保证不重复，但是如果要保证高可用行，使用zk比较好。如果一个节点发生失败，另为一个节点上去会将对应的任务接手过来进行处理。
+
+
+
+五: RabbitMQ集群
+    RabbitMQ的集群主要有三种方式，分别是:本地局域网Cluster，federation，shovel。
+    RabbitMQ Cluster主要是用于同一个网段内的局域网。
+    federation和shovel可以用于广域网，shovel比federation更底层，可以用于更多地方。
+
+    单机集群:(因为配置了环境变量所以可以直接执行)
+        RABBITMQ_NODE_PORT=5672 RABBITMQ_SERVER_START_ARGS="-rabbitmq_management listener [{port,15672}]" RABBITMQ_NODENAME=rabbit rabbitmq-server -detached
+        RABBITMQ_NODE_PORT=5673 RABBITMQ_SERVER_START_ARGS="-rabbitmq_management listener [{port,15673}]" RABBITMQ_NODENAME=hare rabbitmq-server -detached
+        注意:单机的话要指定端口 除了node的端口 还需要指定插件的端口 不然启动会失败
+
+        ---- 把hare加入到rabbit中 (需要先停掉hare上的应用 如果有的话)
+        rabbitmqctl -n hare stop_app
+        rabbitmqctl -n hare join_cluster rabbit@seaway1
+        rabbitmqctl -n hare start_app
+
+        --- 如果你之前是单节点形式 也添加过用户 和vhost  那么集群后会丢失 所以需要重新添加用户 赋权
+        rabbitmqctl add_user icomm icomm
+        rabbitmqctl set_user_tags icomm administrator
+        rabbitmqctl set_permissions -p / icomm ".*" ".*" ".*"
+
+        --- 查看节点状态 (-n 指定节点名称)
+        rabbitmqctl status    或  rabbitmqctl -n hare status
+
+        -- 其他操作
+        停止节点的应用程序:      rabbitmqctl -n hare@seaway1 stop_app
+        重新设置节点的元数据和状态为清空状态: rabbitmqctl -n hare@seaway1 reset
+
+
+    多机集群:
+        多机集群的话 节点（各个node）之间是怎么互通的呢 ？ 是通过erlang cookie （RabbitMQ启动的时候 自动生成）
+        根据安装方式的不同 .erlang.cookie 会在不同的位置
+        rpm安装的话 在： /var/lib/rabbitmq/.erlang.cookie   解压安装的话在： $HOME/.erlang.cookie （如我们此处的在 ／home／qh下）
+        --------- 安装
+        在同一网段的三台机器上分别安装RabbitMQ（此时安装跟单机单节点一样），然后启动各个Node
+        rabbit1$ rabbitmq-server -detached
+        rabbit2$ rabbitmq-server -detached
+        rabbit3$ rabbitmq-server -detached
+
+        --------- 查看节点状态（出现以下说明安装成功）
+        rabbit1$ rabbitmqctl cluster_status
+        Cluster status of node rabbit@rabbit1 ...
+        [{nodes,[{disc,[rabbit@rabbit1]}]},{running_nodes,[rabbit@rabbit1]}]
+        ...done.
+
+        --------- 添加节点rabbit2／rabbit3 到 rabbit1上 （同样是先停掉rabbit2和rabbit3上的应用）
+
+        rabbit2$ rabbitmqctl stop_app
+        Stopping node rabbit@rabbit2 ...done.
+        rabbit2$ rabbitmqctl join_cluster --ram rabbit@rabbit1     #加入到rabbit节点中，使用内存模式（有disk和ram两种，但是一个集群中至少要有一个disk模式 可通过rabbitmqctl change_cluster_node_type disc 修改）
+        Clustering node rabbit@rabbit2 with [rabbit@rabbit1] ...done.
+        rabbit2$ rabbitmqctl start_app
+        Starting node rabbit@rabbit2 ...done.
+
+        -------- 移除某个node
+        rabbit1$ rabbitmqctl stop_app
+        Stopping node rabbit@rabbit1 ...done.
+        rabbit2$ rabbitmqctl forget_cluster_node rabbit@rabbit1
+        Removing node rabbit@rabbit1 from cluster ...
+        ...done.
+
+        注意： 移除后重新start_app是会报错的 必须要rabbitmqctl reset下 然后在 start_app才行
+
+
+
+        集群其他注意事项：
+            RabbitMQ Cluster是根据Erlang的实现的。必须满足一下几个要求：
+            所有机器上，必须Erlang运行时和RabbitMQ的版本相同。（否则会不能连接到一起）
+            所有机器上，的Erlang的Cookie都相同。
+            注意：由于RabbitMQ会使用Node@HostName，如果你在/etc/hosts里面定义了IP HostName关系，当你的IP发生变化时，命令行都会失去作用。
+
+
+
+    六：RabbitMQ的Q&A
+        RabbitMQ会在硬盘空间不够的时候，阻止Producer发送消息。这样可以保证RabbitMQ可以再任何时候，将内存中的数据置换到磁盘中来。通常会将硬盘剩余数据大小设置为机器的总内存大小。
+        全局流控制会被触发，当可用总硬盘容量已经低于配置信息。broker数据库将会最少10秒检查一下警告是否发出或者清除。
+        在RabbitMQ启动的后，会打印disk limit限制，但是不能识别的平台就不能显示信息。
+        注意：当RabbitMQ是集群情况下，当其中有一台机器硬盘不足的时候，所有节点的producer链接都会被阻止。
+        RabbitMQ会定期价检查总磁盘可用空间的大小。通常时间为10秒每次，当限制快被达到时候，RabbitMQ检查的时候会达到10次/s.
+
+        默认的IP端口:
+        amqp默认绑定IP（本机所有IP），端口：5672
+        clustering默认绑定IP（本机所有IP），端口：25672
+        RabbitMQ Management插件 （本机所有IP），端口：15672
